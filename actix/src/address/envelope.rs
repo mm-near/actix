@@ -1,3 +1,4 @@
+use log::error;
 use tokio::sync::oneshot::Sender;
 
 use crate::actor::{Actor, AsyncContext};
@@ -75,6 +76,7 @@ where
         if tx.is_some() && tx.as_ref().unwrap().is_closed() {
             return;
         }
+        error!("About to handle {}", std::any::type_name::<M>());
 
         if let Some(msg) = self.msg.take() {
             let fut = <A as Handler<M>>::handle(act, msg, ctx);

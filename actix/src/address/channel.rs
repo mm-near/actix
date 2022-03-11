@@ -10,10 +10,12 @@ use std::{fmt, task};
 use std::{thread, usize};
 
 use futures_core::stream::Stream;
+use log::error;
 use parking_lot::Mutex;
 use tokio::sync::oneshot::{channel as sync_channel, Receiver};
 
 use crate::actor::Actor;
+use crate::fut::err;
 use crate::handler::{Handler, Message};
 
 use super::envelope::{Envelope, ToEnvelope};
@@ -337,6 +339,25 @@ impl<A: Actor> AddressSender<A> {
         }
     }
 
+    pub fn do_send_debug<M>(&self, msg: M) -> Result<(), SendError<M>>
+    where
+        A: Handler<M>,
+        <A as Actor>::Context: ToEnvelope<A, M>,
+        M::Result: Send,
+        M: Message + Send,
+    {
+        if self.inc_num_messages_debug().is_none() {
+            Err(SendError::Closed(msg))
+        } else {
+            // If inc_num_messages returned Some(park_self), then the mailbox is still active.
+            // We ignore the boolean (indicating to park and wait) in the Some, and queue the
+            // message regardless.
+            let env = <A::Context as ToEnvelope<A, M>>::pack(msg, None);
+            self.queue_push_and_signal_debug(env);
+            Ok(())
+        }
+    }
+
     /// Downgrade to `WeakAddressSender` which can later be upgraded
     pub fn downgrade(&self) -> WeakAddressSender<A> {
         WeakAddressSender {
@@ -353,6 +374,15 @@ impl<A: Actor> AddressSender<A> {
         // receiver is parked, this will unpark the task.
         self.signal();
     }
+    // Push message to the queue and signal to the receiver
+    fn queue_push_and_signal_debug(&self, msg: Envelope<A>) {
+        // Push the message onto the message queue
+        self.inner.message_queue.push(msg);
+
+        // Signal to the receiver that a message has been enqueued. If the
+        // receiver is parked, this will unpark the task.
+        self.signal_debug();
+    }
 
     // Increment the number of queued messages. Returns if the sender should
     // block.
@@ -364,6 +394,33 @@ impl<A: Actor> AddressSender<A> {
                 return None;
             }
             state.num_messages += 1;
+
+            let next = encode_state(&state);
+            match self
+                .inner
+                .state
+                .compare_exchange(curr, next, SeqCst, SeqCst)
+            {
+                Ok(_) => {
+                    // receiver is full
+                    let buffer = self.inner.buffer.load(Relaxed);
+                    let park_self = buffer != 0 && state.num_messages >= buffer;
+                    return Some(park_self);
+                }
+                Err(actual) => curr = actual,
+            }
+        }
+    }
+
+    fn inc_num_messages_debug(&self) -> Option<bool> {
+        let mut curr = self.inner.state.load(SeqCst);
+        loop {
+            let mut state = decode_state(curr);
+            if !state.is_open {
+                return None;
+            }
+            state.num_messages += 1;
+            error!("num messages: {:?}", state.num_messages);
 
             let next = encode_state(&state);
             match self
@@ -407,6 +464,36 @@ impl<A: Actor> AddressSender<A> {
         };
 
         if let Some(task) = task {
+            task.wake();
+        }
+    }
+    fn signal_debug(&self) {
+        // TODO
+        // This logic can probably be improved by guarding the lock with an
+        // atomic.
+        //
+        // Do this step first so that the lock is dropped when
+        // `unpark` is called
+        let task = {
+            let mut recv_task = self.inner.recv_task.lock();
+
+            // If the receiver has already been unparked, then there is nothing
+            // more to do
+            if recv_task.unparked {
+                error!("Task is unparked");
+                return;
+            }
+
+            // Setting this flag enables the receiving end to detect that
+            // an unpark event happened in order to avoid unnecessarily
+            // parking.
+            recv_task.unparked = true;
+            error!("Making task unparked");
+            recv_task.task.take()
+        };
+
+        if let Some(task) = task {
+            error!("Waking task..");
             task.wake();
         }
     }
@@ -811,6 +898,7 @@ impl<A: Actor> AddressReceiver<A> {
             let mut state = decode_state(curr);
 
             state.num_messages -= 1;
+            error!("Decreasing state: {:?}", state.num_messages);
 
             let next = encode_state(&state);
             match self

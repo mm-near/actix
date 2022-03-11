@@ -104,6 +104,17 @@ impl<A: Actor> Addr<A> {
         let _ = self.tx.do_send(msg);
     }
 
+
+    pub fn do_send_debug<M>(&self, msg: M)
+    where
+        M: Message + Send,
+        M::Result: Send,
+        A: Handler<M>,
+        A::Context: ToEnvelope<A, M>,
+    {
+        let _ = self.tx.do_send_debug(msg);
+    }
+
     /// Tries to send a message.
     ///
     /// This method fails if actor's mailbox is full or closed. This
